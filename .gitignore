@@ -1,8 +1,7 @@
-test/results/
-test/regression.diffs
-test/regression.out
-*.zip
-.env
+# Compiled and build artifacts
 __pycache__/
-.DS_Store
-core
+*.pyc
+
+# Dependencies
+venv/
+.venv/
