@@ -1,0 +1,27 @@
+# jev provider configuration. Parsed by the config parser (lib/jev/config.py) and handed to
+# JevFactory (lib/jev/factory.py), which builds the universal JevClient with the matching adapter.
+# The evaluation core never reads this file directly and never knows which provider is in use.
+jev:
+  # Which adapter to build: "typesafe" (default, native Jev API) or "openrouter".
+  # Set this to "openrouter" to have the factory create only the OpenRouter client.
+  provider: typesafe
+
+  # Generic settings (a session GUC such as jev.api_key / jev.model overrides these).
+  # api_url: https://api.typesafe.ai/v1/systemone
+  # model: jev-latest
+  timeout: 30
+  keepalive: 600
+  concurrency: 16
+
+  # Name of the environment variable holding the provider key (default JEV_API_KEY;
+  # each adapter also falls back to its own provider variables, e.g. TYPESAFE_API_KEY,
+  # OPENROUTER_API_KEY / OPENROUTER_API). Keys are never stored in this file.
+  # api_key_env: OPENROUTER_API_KEY
+
+  # Per-adapter overrides, applied only when that adapter is selected:
+  adapters:
+    openrouter:
+      base_url: https://openrouter.ai/api/v1/chat/completions
+      model: deepseek/deepseek-chat-v3.1
+      # http_referer: https://your-app.example
+      # app_title: pg-jev

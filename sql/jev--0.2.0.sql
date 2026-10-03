@@ -16,16 +16,21 @@
 -- for the session, so re-running a query, changing the threshold or sorting by probability is free.
 --
 -- Settings (SET jev.<name> = ...):
---   jev.api_key            TypeSafe API key (falls back to the TYPESAFE_API_KEY env var of the server)
---   jev.model              default 'jev-latest'
+--   jev.config_file        provider config YAML, default 'configs/jevs.yml' (also $JEV_CONFIG); its
+--                          'jev.provider' selects the adapter (typesafe | openrouter) via JevFactory —
+--                          the core itself never knows which provider is in use
+--   jev.api_key            provider API key (falls back to JEV_API_KEY, then TYPESAFE_API_KEY /
+--                          OPENROUTER_API_KEY (or OPENROUTER_API), or api_key_env from jevs.yml)
+--   jev.model              default 'jev-latest' (native provider; overridden by jevs.yml / the adapter's own default)
 --   jev.threshold          default 0.5   probability at which jev() returns true
 --   jev.batch_size         default 20    rows per API request (accuracy drops measurably above ~20-25 rows)
 --   jev.concurrency        default 16    parallel API requests
 --   jev.max_prefetch_rows  default 5000  how far past a cache miss the read-ahead scans to find the row, and
 --                                        how many skipped rows it keeps for later (memory bound)
 --   jev.notices            default 'on'  emit progress NOTICEs and a summary per table read-ahead
---   jev.api_url            default 'https://api.typesafe.ai/v1/systemone' (proxies, mocks, tests)
---   jev.timeout            default 30    seconds per API request
+--   jev.api_url            native provider endpoint; default 'https://api.typesafe.ai/v1/systemone'
+--                         (proxies, mocks, tests). OpenRouter uses base_url from configs/jevs.yml.
+--   jev.timeout            default 30    seconds per API request (adapters may raise it: OpenRouter 60)
 --   jev.keepalive          default 600   seconds a pooled API connection may sit idle before it is reconnected
 --   jev.max_rows_per_statement   default 0 (off)  never send more rows than this to the API in one statement
 --   jev.max_chars_per_statement  default 0 (off)  never send more characters of row data than this in one statement
@@ -38,14 +43,13 @@ RETURNS jsonb
 LANGUAGE plpython3u
 STABLE
 AS $py$
-import json, os, time, hashlib, threading, random, ssl, socket, select, http.client
+import json, os, time, hashlib, threading, random, sys
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-from urllib.parse import urlsplit
 
 USD_PER_INPUT_TOKEN = 0.042 / 1_000_000  # jev-1.13 list price; output tokens are free
 PAGE_ROWS = 1000                          # rows read from the table per SPI query
-STATE_VERSION = 2
+STATE_VERSION = 3                         # 3: provider layer (interface + adapters + JevFactory)
 
 # ---------------------------------------------------------------- session state (survives across calls)
 if GD.get("jev", {}).get("version") != STATE_VERSION:
@@ -58,7 +62,7 @@ if GD.get("jev", {}).get("version") != STATE_VERSION:
         "plans": {},
         "lock": threading.Lock(),
         "pool": None, "pool_size": 0,   # ThreadPoolExecutor shared by all jobs of this session
-        "conns": {},                    # (scheme, host, port) -> [idle keep-alive connections]
+        "client_cache": {},             # settings fingerprint -> universal JevClient (from JevFactory)
         "stmt": {"ts": None, "rows": 0, "chars": 0},   # per-statement spend guard
     }
 S = GD["jev"]
@@ -77,6 +81,7 @@ CFG_SQL = """SELECT statement_timestamp()::text AS ts,
   current_setting('jev.max_prefetch_rows', true) AS max_prefetch_rows, current_setting('jev.notices', true) AS notices,
   current_setting('jev.api_url', true) AS api_url, current_setting('jev.timeout', true) AS timeout,
   current_setting('jev.keepalive', true) AS keepalive,
+  current_setting('jev.config_file', true) AS config_file,
   current_setting('jev.max_rows_per_statement', true) AS max_rows, current_setting('jev.max_chars_per_statement', true) AS max_chars"""
 
 def load_cfg():
@@ -84,154 +89,467 @@ def load_cfg():
     def g(name, default):
         v = r[name]
         return default if v in (None, "") else v
-    key = g("api_key", None) or os.environ.get("TYPESAFE_API_KEY")
-    if not key:
-        plpy.error("jev: no API key. SET jev.api_key = '...' or start the server with TYPESAFE_API_KEY set.")
-    url = urlsplit(g("api_url", "https://api.typesafe.ai/v1/systemone"))
     return {
-        "ts": r["ts"], "api_key": key, "model": g("model", "jev-latest"),
+        "ts": r["ts"],
+        "api_key": g("api_key", None), "model": g("model", None),
         "batch_size": max(1, int(g("batch_size", "20"))), "concurrency": max(1, int(g("concurrency", "16"))),
         "max_prefetch": max(1, int(g("max_prefetch_rows", "5000"))),
         "notices": g("notices", "on").lower() in ("on", "true", "1", "yes"),
-        "timeout": float(g("timeout", "30")), "keepalive": float(g("keepalive", "600")),
+        "timeout": g("timeout", None), "keepalive": g("keepalive", None),
         "max_rows": int(g("max_rows", "0")), "max_chars": int(g("max_chars", "0")),
-        "scheme": url.scheme, "host": url.hostname, "port": url.port,
-        "path": (url.path or "/") + ("?" + url.query if url.query else ""),
+        "api_url": g("api_url", None), "config_file": g("config_file", None),
     }
 
-# ---------------------------------------------------------------- question builders
-opts = json.loads(options) if options else None
+# ---------------------------------------------------------------- provider layer: universal interface + adapters + JevFactory
+# The core below only ever talks to a JevClient built by JevFactory from the parsed configs/jevs.yml.
+# It never references a provider name or an adapter class; which provider serves the requests is
+# entirely the factory's decision. Source of record: lib/jev/ (interface.py, config.py, factory.py,
+# adapters/{_common,typesafe,openrouter}.py); the embedded fallback between the markers below is
+# kept in sync with it.
+# The package lives beside the installed SQL (share/jev -> ../lib/jev) or in the repo checkout.
+JEV_LIB_PATHS = []
+try:
+    _sharedir = plpy.execute(plan("sharedir", "SELECT setting AS d FROM pg_config WHERE name = 'SHAREDIR'", []))[0]["d"]
+    JEV_LIB_PATHS.append(os.path.join(_sharedir, "jev", "lib"))
+except Exception:
+    pass
+JEV_LIB_PATHS.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+for _p in [x for x in os.environ.get("JEV_LIB", "").split(os.pathsep) if x] + JEV_LIB_PATHS:
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
-def build_question(i):
-    ref = "rows[%d]" % i
-    if kind == "noul":
-        return {"type": "noul",
-                "instructions": "Does the record `%s` satisfy the condition stated in `condition`?" % ref}
-    if kind == "score":
-        return {"type": "score", "instructions": "Rate the record `%s`: %s" % (ref, query), "criteria": opts}
-    if kind == "choice":
-        return {"type": "choice", "instructions": "For the record `%s`: %s" % (ref, query),
-                "criteria": {o: None for o in opts}}
-    raise RuntimeError("jev: unknown kind %r" % kind)
+try:
+    from jev.interface import JevError, JevRetryable, JevAdapter, JevClient
+    from jev.config import parse as _jev_parse
+    from jev.factory import JevFactory
+except ImportError:
+    # >>> BEGIN EMBEDDED jev provider layer (mirror of lib/jev; do not edit one side without the other)
 
-def request_body(cfg, rows):
-    state = {"condition": query, "rows": rows} if kind == "noul" else {"rows": rows}
-    return json.dumps({"model": cfg["model"], "state": state,
-                       "questions": {("r%d" % i): build_question(i) for i in range(len(rows))}}).encode()
+    class JevError(Exception):
+        """Non-retryable provider failure (bad key, invalid request, quota...)."""
 
-# ---------------------------------------------------------------- HTTP: persistent connections, retries (threads: no plpy here)
-def conn_key(cfg):
-    return (cfg["scheme"], cfg["host"], cfg["port"])
+    class JevRetryable(Exception):
+        """Transient provider failure (429/408/5xx); carries an optional Retry-After delay."""
+        def __init__(self, message, retry_after=None):
+            Exception.__init__(self, message)
+            self.retry_after = retry_after
 
-def alive(c):
-    """An idle keep-alive connection never has unread data: readability means EOF or a TLS close alert."""
-    sock = c.sock
-    if sock is None:
-        return False
-    try:
-        readable, _, _ = select.select([sock], [], [], 0)
-        return not readable
-    except (OSError, ValueError):
-        return False
+    class JevAdapter(object):
+        """Transport + translation for one provider. Implementations must be thread-safe."""
+        name = "abstract"
+        def evaluate(self, state, questions):
+            raise NotImplementedError("adapter %s does not implement evaluate()" % self.name)
 
-def borrow_conn(cfg):
-    while True:
-        with LOCK:
-            idle = S["conns"].setdefault(conn_key(cfg), [])
-            entry = idle.pop() if idle else None
-        if entry is None:
-            break
-        c, last_used = entry
-        if time.time() - last_used < cfg["keepalive"] and alive(c):
-            return c, True
-        c.close()                            # idle too long or closed by the server: never send into a dead socket
-    if cfg["scheme"] == "https":
-        if S.get("ssl_ctx") is None:
-            S["ssl_ctx"] = ssl.create_default_context()   # loading the CA bundle once per session, not per connection
-        c = http.client.HTTPSConnection(cfg["host"], cfg["port"], timeout=cfg["timeout"], context=S["ssl_ctx"])
-    else:
-        c = http.client.HTTPConnection(cfg["host"], cfg["port"], timeout=cfg["timeout"])
-    return c, False
+    class JevClient(object):
+        """Universal handle the core holds: delegates straight to the injected adapter."""
+        def __init__(self, adapter):
+            if not isinstance(adapter, JevAdapter):
+                raise TypeError("JevClient needs a JevAdapter, got %r" % type(adapter))
+            self.adapter = adapter
+        def evaluate(self, state, questions):
+            return self.adapter.evaluate(state, questions)
 
-def release_conn(cfg, c, reusable):
-    if not reusable:
-        c.close(); return
-    with LOCK:
-        idle = S["conns"].setdefault(conn_key(cfg), [])
-        if len(idle) < cfg["concurrency"]:
-            idle.append((c, time.time())); return
-    c.close()
+    import http.client, socket, ssl, select
+    from urllib.parse import urlsplit
 
-def tcp_keepalive(c):
-    """Let the kernel notice a silently dropped peer within about a minute (probes after 30 s idle, every 10 s,
-    3 misses), so a pooled connection that a NAT or the server dropped without a FIN fails fast instead of
-    stalling a request until jev.timeout."""
-    try:
-        sock = c.sock
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        for name, value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
-            if hasattr(socket, name):
-                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
-    except OSError:
-        pass
+    def _merged(section, gucs, key, default=None):
+        """Setting precedence: session GUC > configs/jevs.yml section > built-in default."""
+        v = gucs.get(key)
+        if v not in (None, ""):
+            return v
+        v = section.get(key)
+        if v not in (None, ""):
+            return v
+        return default
 
-def retry_after_seconds(resp):
-    v = resp.getheader("retry-after-ms")
-    if v and v.strip().isdigit():
-        return int(v) / 1000.0
-    v = resp.getheader("retry-after")
-    if v:
+    def _retry_after_seconds(getheader):
+        v = getheader("retry-after-ms") if getheader else None
+        if v and v.strip().isdigit():
+            return int(v) / 1000.0
+        v = getheader("retry-after") if getheader else None
+        if v:
+            try:
+                return float(v)
+            except ValueError:
+                pass
+        return None
+
+    _RETRYABLE_STATUS = (408, 429, 500, 502, 503, 529)
+
+    def _resolve_key(gucs, section, env_defaults):
+        """API key: jev.api_key GUC > yml api_key > api_key_env variable > adapter's own env fallbacks."""
+        key = gucs.get("api_key") or section.get("api_key")
+        if key:
+            return key
+        var = section.get("api_key_env")
+        if var:
+            return os.environ.get(var)
+        for name in env_defaults:
+            v = os.environ.get(name)
+            if v:
+                return v
+        return None
+
+    class HttpTransport(object):
+        """Pooled keep-alive connections keyed by (scheme, host, port). Thread-safe pool."""
+        _ssl_ctx = None
+        def __init__(self, timeout=30.0, keepalive=600.0, max_idle=16):
+            self.timeout = float(timeout)
+            self.keepalive = float(keepalive)
+            self.max_idle = int(max_idle)
+            self._lock = threading.Lock()
+            self._idle = {}                    # (scheme, host, port) -> [(conn, last_used)]
+        @classmethod
+        def _context(cls):
+            if HttpTransport._ssl_ctx is None:
+                HttpTransport._ssl_ctx = ssl.create_default_context()   # CA bundle once per backend
+            return HttpTransport._ssl_ctx
+        @staticmethod
+        def _alive(c):
+            """An idle keep-alive connection never has unread data: readability means EOF or TLS close."""
+            sock = c.sock
+            if sock is None:
+                return False
+            try:
+                readable, _, _ = select.select([sock], [], [], 0)
+                return not readable
+            except (OSError, ValueError):
+                return False
+        def borrow(self, target):
+            key = (target["scheme"], target["host"], target["port"])
+            while True:
+                with LOCK:
+                    lst = self._idle.setdefault(key, [])
+                    entry = lst.pop() if lst else None
+                if entry is None:
+                    break
+                c, last_used = entry
+                if time.time() - last_used < self.keepalive and self._alive(c):
+                    return c, True
+                c.close()                      # idle too long or closed by the server: never send into a dead socket
+            if target["scheme"] == "https":
+                c = http.client.HTTPSConnection(key[1], key[2], timeout=self.timeout, context=self._context())
+            else:
+                c = http.client.HTTPConnection(key[1], key[2], timeout=self.timeout)
+            return c, False
+        def return_conn(self, target, c, reusable):
+            key = (target["scheme"], target["host"], target["port"])
+            if not reusable:
+                c.close(); return
+            with LOCK:
+                idle = self._idle.setdefault(key, [])
+                if len(idle) < self.max_idle:
+                    idle.append((c, time.time())); return
+            c.close()
+        def post_json(self, target, path, payload, headers):
+            body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+            c, reused = self.borrow(target)
+            try:
+                if not reused:
+                    c.connect()
+                    self._tcp_keepalive(c)
+                c.request("POST", path, body=body, headers=headers)
+                resp = c.getresponse()
+                raw = resp.read()
+                status, will_close, getheader = resp.status, resp.will_close, resp.getheader
+            except (http.client.HTTPException, OSError):
+                c.close()
+                raise
+            self.return_conn(target, c, not will_close)
+            return status, getheader, raw
+        @staticmethod
+        def _tcp_keepalive(c):
+            """Kernel notices a dropped peer in ~1 min so pooled conns fail fast instead of stalling until timeout."""
+            try:
+                sock = c.sock
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                for name, value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+                    if hasattr(socket, name):
+                        sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+            except OSError:
+                pass
+
+    _TS_DEFAULT_URL = "https://api.typesafe.ai/v1/systemone"
+
+    class TypeSafeAdapter(JevAdapter):
+        """Native TypeSafe SystemOne wire format; response already matches the normalised shape."""
+        name = "typesafe"
+        ENV_KEYS = ("JEV_API_KEY", "TYPESAFE_API_KEY")
+        def __init__(self, target, path, model, api_key, transport):
+            self.target, self.path, self.model, self.api_key, self.transport = target, path, model, api_key, transport
+        @classmethod
+        def from_settings(cls, section, gucs):
+            api_key = _resolve_key(gucs, section, cls.ENV_KEYS)
+            if not api_key:
+                raise JevError("jev: no API key for provider 'typesafe'. SET jev.api_key = '...', "
+                               "export TYPESAFE_API_KEY (or JEV_API_KEY), or point jevs.yml at another provider.")
+            url = urlsplit(_merged(section, gucs, "api_url", _TS_DEFAULT_URL))
+            transport = HttpTransport(timeout=float(_merged(section, gucs, "timeout", 30)),
+                                      keepalive=float(_merged(section, gucs, "keepalive", 600)),
+                                      max_idle=max(1, int(_merged(section, gucs, "concurrency", 16))))
+            return cls({"scheme": url.scheme, "host": url.hostname, "port": url.port},
+                       (url.path or "/") + ("?" + url.query if url.query else ""),
+                       _merged(section, gucs, "model", "jev-latest"), api_key, transport)
+        def evaluate(self, state, questions):
+            payload = json.dumps({"model": self.model, "state": state, "questions": questions}).encode()
+            headers = {"Authorization": "Bearer " + self.api_key, "Content-Type": "application/json",
+                       "User-Agent": "pg-jev/0.2.0"}
+            status, getheader, raw = self.transport.post_json(self.target, self.path, payload, headers)
+            if status == 200:
+                data = json.loads(raw.decode())
+                data["_ms"] = 0.0
+                return data
+            snippet = "%s %s" % (status, raw.decode(errors="replace")[:300])
+            if status in _RETRYABLE_STATUS:
+                raise JevRetryable("jev: provider error " + snippet, retry_after=_retry_after_seconds(getheader))
+            raise JevError("jev: provider error " + snippet)
+
+    _OR_DEFAULT_BASE = "https://openrouter.ai/api/v1/chat/completions"
+    _OR_DEFAULT_MODEL = "deepseek/deepseek-chat-v3.1"
+
+    def _or_render(state, questions):
+        """One prompt carrying the shared state plus every question; answers keyed by question id."""
+        lines = ["You are Jev, a precise evaluator. Judge each QUESTION against the RECORDS.",
+                 "", "RECORDS (JSON array, referenced as rows[i]):", json.dumps(state.get("rows", []))]
+        cond = state.get("condition")
+        if cond:
+            lines += ["", "Shared condition for every yes/no question: %r" % cond]
+        lines += ["", "QUESTIONS (answer every id):"]
+        schema_parts = []
+        for qid, q in sorted(questions.items()):
+            kind = q["type"]
+            instr = q.get("instructions", "")
+            if kind == "noul":
+                lines.append("%s: %s -> answer the probability (0..1) that it holds" % (qid, instr))
+                schema_parts.append('"%s": {"type":"noul","noul":<p>}' % qid)
+            elif kind == "score":
+                levels = q.get("criteria") or []
+                legend = ", ".join("%d=%s" % (i, l) for i, l in enumerate(levels))
+                lines.append("%s: %s -> rate on the ordered scale (%s); score = probability-weighted "
+                             "index (0..%g)" % (qid, instr, legend, len(levels) - 1))
+                schema_parts.append('"%s": {"type":"score","score":<x>,"probabilities":{"<idx>":<p>,...},'
+                                    '"confidence":<c>}' % qid)
+            elif kind == "choice":
+                opts = list((q.get("criteria") or {}).keys())
+                lines.append("%s: %s -> pick exactly one of %s" % (qid, instr, json.dumps(opts)))
+                schema_parts.append('"%s": {"type":"choice","choice":"<option>","probabilities":{...},'
+                                    '"confidence":<c>}' % qid)
+            else:
+                raise JevError("jev: OpenRouter adapter got unknown question kind %r" % kind)
+        lines += ["", "Reply with ONLY a JSON object, nothing else:", "{ " + ", ".join(schema_parts) + " }",
+                  "Probabilities must be numbers between 0 and 1."]
+        return "\n".join(lines)
+
+    class OpenRouterAdapter(JevAdapter):
+        """Jev over OpenRouter chat completions; replies normalised to the universal answer shape."""
+        name = "openrouter"
+        ENV_KEYS = ("JEV_API_KEY", "OPENROUTER_API_KEY", "OPENROUTER_API")
+        def __init__(self, target, path, model, api_key, extra_headers, transport):
+            self.target, self.path, self.model = target, path, model
+            self.headers = {"Authorization": "Bearer " + api_key, "Content-Type": "application/json"}
+            self.headers.update(extra_headers)
+            self.transport = transport
+        @classmethod
+        def from_settings(cls, section, gucs):
+            per = {}
+            adapters = section.get("adapters")
+            if isinstance(adapters, dict) and isinstance(adapters.get(cls.name), dict):
+                per = dict(adapters[cls.name])
+            merged_sec = dict(per)
+            merged_sec.update({k: v for k, v in section.items() if k != "adapters"})
+            api_key = _resolve_key(gucs, merged_sec, cls.ENV_KEYS)
+            if not api_key:
+                raise JevError("jev: no API key for provider 'openrouter'. Export OPENROUTER_API_KEY "
+                               "(or set api_key_env in configs/jevs.yml, or SET jev.api_key).")
+            url = urlsplit(_merged(merged_sec, gucs, "base_url", _OR_DEFAULT_BASE))
+            transport = HttpTransport(timeout=float(_merged(merged_sec, gucs, "timeout", 60)),
+                                      keepalive=float(_merged(merged_sec, gucs, "keepalive", 600)),
+                                      max_idle=max(1, int(_merged(merged_sec, gucs, "concurrency", 16))))
+            extra = {}
+            referer = _merged(merged_sec, gucs, "http_referer", None)
+            title = _merged(merged_sec, gucs, "app_title", "pg-jev")
+            if referer:
+                extra["HTTP-Referer"] = referer
+            if title:
+                extra["X-Title"] = title
+            return cls({"scheme": url.scheme, "host": url.hostname, "port": url.port},
+                       (url.path or "/") + ("?" + url.query if url.query else ""),
+                       _merged(merged_sec, gucs, "model", _OR_DEFAULT_MODEL), api_key, extra, transport)
+        def evaluate(self, state, questions):
+            payload = json.dumps({"model": self.model,
+                                  "messages": [{"role": "user", "content": _or_render(state, questions)}],
+                                  "temperature": 0, "max_tokens": 4096}).encode()
+            status, getheader, raw = self.transport.post_json(self.target, self.path, payload, self.headers)
+            if status == 200:
+                return self._normalise(json.loads(raw.decode()), questions)
+            snippet = "%s %s" % (status, raw.decode(errors="replace")[:300])
+            if status in _RETRYABLE_STATUS:
+                raise JevRetryable("jev: OpenRouter error " + snippet, retry_after=_retry_after_seconds(getheader))
+            raise JevError("jev: OpenRouter error " + snippet)
+        def _normalise(self, data, questions):
+            err = data.get("error")
+            if err:
+                raise JevError("jev: OpenRouter returned an error: %s" % json.dumps(err)[:300])
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                raise JevError("jev: OpenRouter response has no message content")
+            obj = self._extract_json(content)
+            usage = data.get("usage") or {}
+            answers = {}
+            for qid, q in questions.items():
+                a = obj.get(qid)
+                if not isinstance(a, dict):
+                    raise JevError("jev: OpenRouter answer is missing %r" % qid)
+                answers[qid] = self._coerce(qid, q, a)
+            out = {"model": data.get("model", self.model), "answers": answers,
+                   "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                             "output_tokens": usage.get("completion_tokens", 0)}}
+            out["_ms"] = 0.0
+            return out
+        @staticmethod
+        def _extract_json(text):
+            start, end = text.find("{"), text.rfind("}")
+            if start == -1 or end <= start:
+                raise JevError("jev: OpenRouter model did not return a JSON object: %r" % text[:200])
+            try:
+                return json.loads(text[start:end + 1])
+            except ValueError as e:
+                raise JevError("jev: OpenRouter model returned invalid JSON: %s" % e)
+        @staticmethod
+        def _coerce(qid, q, a):
+            kind = q["type"]
+            if kind == "noul":
+                try:
+                    p = float(a.get("noul", a.get("probability")))
+                except (TypeError, ValueError):
+                    raise JevError("jev: OpenRouter answer %r is not a probability" % qid)
+                return {"type": "noul", "noul": min(max(p, 0.0), 1.0)}
+            if kind == "score":
+                n = len(q.get("criteria") or [])
+                try:
+                    score = float(a.get("score"))
+                except (TypeError, ValueError):
+                    raise JevError("jev: OpenRouter answer %r has no numeric score" % qid)
+                probs = {str(i): float(a.get("probabilities", {}).get(str(i), 0.0)) for i in range(n)} \
+                    if isinstance(a.get("probabilities"), dict) else {}
+                return {"type": "score", "score": min(max(score, 0.0), max(n - 1.0, 0.0)),
+                        "legend": {str(i): l for i, l in enumerate(q["criteria"])},
+                        "probabilities": probs, "confidence": float(a.get("confidence", 0.0))}
+            opts = list((q.get("criteria") or {}).keys())
+            choice = a.get("choice")
+            if choice not in opts:
+                raise JevError("jev: OpenRouter choice %r is not one of the options for %r" % (choice, qid))
+            probs = a.get("probabilities") if isinstance(a.get("probabilities"), dict) else {}
+            return {"type": "choice", "choice": choice, "probabilities": probs,
+                    "confidence": float(a.get("confidence", 0.0))}
+
+    _JEV_ADAPTERS = {"typesafe": TypeSafeAdapter, "openrouter": OpenRouterAdapter}
+
+    def _jev_parse(raw_text):
+        """Parse jevs.yml contents into the 'jev' section dict (YAML via PyYAML, else JSON)."""
         try:
-            return float(v)
-        except ValueError:
-            pass
-    return None
+            import yaml as _y
+        except ImportError:
+            _y = None
+        doc = (_y.safe_load(raw_text) if _y is not None else json.loads(raw_text)) or {}
+        if not isinstance(doc, dict):
+            raise ValueError("jev: config root must be a mapping with a 'jev' section")
+        sec = doc.get("jev") or {}
+        if not isinstance(sec, dict):
+            raise ValueError("jev: 'jev:' section of the config must be a mapping")
+        return sec
 
-def call_api(cfg, rows):
-    body = request_body(cfg, rows)
-    headers = {"Authorization": "Bearer " + cfg["api_key"], "Content-Type": "application/json",
-               "User-Agent": "pg-jev/0.2.0"}
+    class JevFactory(object):
+        """Turns the parsed configs/jevs.yml object into a universal JevClient. The only code that
+        knows provider names exist; the core just calls factory.client(gucs).evaluate(...)."""
+        def __init__(self, section=None):
+            self.section = section or {}
+            name = (self.section.get("provider") or "typesafe").strip().lower()
+            dotted = self.section.get("adapter_class")
+            if dotted:                       # escape hatch: fully qualified adapter class in the yml
+                mod, _, attr = dotted.rpartition(".")
+                cls = getattr(__import__(mod, fromlist=[attr]), attr)
+            else:
+                cls = _JEV_ADAPTERS.get(name)
+                if cls is None:
+                    raise JevError("jev: unknown jev.provider %r in configs/jevs.yml (known: %s)"
+                                   % (name, ", ".join(sorted(_JEV_ADAPTERS))))
+            self.provider_name, self.adapter_cls = name, cls
+        @classmethod
+        def from_config(cls, section=None):
+            return cls(section)
+        def client(self, gucs=None):
+            return JevClient(self.adapter_cls.from_settings(self.section, gucs or {}))
+
+    # <<< END EMBEDDED jev provider layer
+
+# ---------------------------------------------------------------- client per settings (built by JevFactory only)
+def _jev_config_section(cfg):
+    """Provider config as a parsed object: $JEV_CONFIG / jev.config_file > default configs/jevs.yml.
+    Relative paths resolve against the install/repo root (same shape as jev_set_config_file)."""
+    path = os.environ.get("JEV_CONFIG") or cfg.get("config_file")
+    if path and not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), path)
+    try:
+        with open(path) as f:                  # absent/broken config -> defaults below
+            return _jev_parse(f.read())
+    except (IOError, TypeError, ValueError):
+        return {}                              # absent/broken config: built-in defaults (native provider)
+
+def jev_client(cfg):
+    """One universal JevClient per distinct settings fingerprint. The adapter behind it is chosen
+    exclusively by JevFactory from the parsed configs/jevs.yml object — this code never branches on
+    a provider name and never imports an adapter class."""
+    gucs = {k: cfg[k] for k in ("api_key", "model", "timeout", "keepalive", "concurrency", "api_url")
+            if cfg.get(k) not in (None, "")}
+    section = _jev_config_section(cfg)
+    fp = json.dumps([section, gucs], sort_keys=True, default=str)
+    with LOCK:
+        client = S["client_cache"].get(fp)
+        if client is None:
+            client = S["client_cache"][fp] = JevFactory.from_config(section).client(gucs)
+        return client
+
+# ---------------------------------------------------------------- evaluation through the universal interface
+def build_payload(rows):
+    """The provider-neutral request: one shared state + one question per row (the universal shape)."""
+    state = {"condition": query, "rows": rows} if kind == "noul" else {"rows": rows}
+    return state, {("r%d" % i): build_question(i) for i in range(len(rows))}
+
+def call_api(client, rows):
+    """Judge a batch through the JevClient the JevFactory built. Provider-agnostic: the core only
+    knows the universal evaluate(state, questions) contract, never which adapter answers."""
+    payload = build_payload(rows)
     delay, last = 0.5, None
     for attempt in range(7):
-        c, reused = borrow_conn(cfg)
         t0 = time.time()
         try:
-            if not reused:
-                c.connect()
-                tcp_keepalive(c)
-            c.request("POST", cfg["path"], body=body, headers=headers)
-            resp = c.getresponse()
-            raw = resp.read()
-        except (http.client.HTTPException, OSError) as e:
-            c.close()
-            last = "%s: %s" % (type(e).__name__, e)
+            data = client.evaluate(*payload)
+        except JevRetryable as e:
+            last = str(e)
             with LOCK:
                 S["stats"]["retries"] += 1
-            if reused and attempt == 0:
-                continue                       # a keep-alive connection went stale: retry at once on a fresh one
-            time.sleep(delay + random.random() * 0.25); delay = min(delay * 2, 8)
-            continue
-        ms = (time.time() - t0) * 1000
-        release_conn(cfg, c, not resp.will_close)
-        if resp.status == 200:
-            data = json.loads(raw.decode())
-            data["_ms"] = ms
-            return data
-        last = "%s %s" % (resp.status, raw.decode(errors="replace")[:300])
-        if resp.status in (408, 429, 529) or resp.status >= 500:
-            with LOCK:
-                S["stats"]["retries"] += 1
-            wait = retry_after_seconds(resp)
+            wait = getattr(e, "retry_after", None)
             time.sleep(min(wait if wait is not None else delay, 30) + random.random() * 0.25)
             delay = min(delay * 2, 8)
             continue
-        raise RuntimeError("jev: TypeSafe API error " + last)
-    raise RuntimeError("jev: TypeSafe API unreachable after retries: " + str(last))
+        except (JevError, RuntimeError, ValueError) as e:
+            raise RuntimeError(str(e))           # non-retryable provider failure
+        except Exception as e:                   # transport hiccup outside the adapter: retry
+            last = "%s: %s" % (type(e).__name__, e)
+            with LOCK:
+                S["stats"]["retries"] += 1
+            time.sleep(delay + random.random() * 0.25); delay = min(delay * 2, 8)
+            continue
+        data["_ms"] = (time.time() - t0) * 1000
+        return data
+    raise RuntimeError("jev: provider unreachable after retries: " + str(last))
 
-def run_batch(cfg, job, bucket, pairs):
-    """Worker thread: judge one batch and store the answers. Returns the number of rows judged."""
+def run_batch(client, cfg, job, bucket, pairs):
+    """Worker thread: judge one batch through the universal client. Returns rows judged."""
     try:
-        data = call_api(cfg, [json.loads(t) for _, t in pairs])
+        data = call_api(client, [json.loads(t) for _, t in pairs])
     except Exception:
         with LOCK:
             S["stats"]["errors"] += 1
@@ -240,7 +558,7 @@ def run_batch(cfg, job, bucket, pairs):
     if any(("r%d" % i) not in answers for i in range(len(pairs))):
         with LOCK:
             S["stats"]["errors"] += 1
-        raise RuntimeError("jev: TypeSafe API response is missing answers (%d of %d)" % (len(answers), len(pairs)))
+        raise RuntimeError("jev: provider response is missing answers (%d of %d)" % (len(answers), len(pairs)))
     usage = data.get("usage", {})
     with LOCK:
         for i, (h, _) in enumerate(pairs):
@@ -361,7 +679,7 @@ def submit(job, cfg, bucket, pairs):
     if not pairs:
         return None
     guard(cfg, pairs)
-    fut = pool(cfg).submit(run_batch, cfg, job, bucket, pairs)
+    fut = pool(cfg).submit(run_batch, jev_client(cfg), cfg, job, bucket, pairs)
     fut.jev_hashes = [h for h, _ in pairs]
     job["futures"].append(fut)
     for h, _ in pairs:
@@ -541,7 +859,9 @@ s.update(jev.get("stats", {}))
 s["estimated_cost_usd"] = round(s.get("input_tokens", 0) * 0.042 / 1_000_000, 6)
 s["cached_answers"] = sum(len(b) for b in jev.get("cache", {}).values())
 s["in_flight"] = sum(1 for j in jev.get("jobs", {}).values() for f in j["futures"] if not f.done())
-s["connections"] = sum(len(v) for v in jev.get("conns", {}).values())   # idle, pooled
+client = next(iter(jev.get("client_cache", {}).values()), None)   # the universal client, whichever adapter backs it
+conns = getattr(getattr(client, "adapter", None), "transport", None)
+s["connections"] = sum(len(v) for v in getattr(conns, "_idle", {}).values()) if conns else 0  # idle, pooled
 return json.dumps(s)
 $py$;
 
@@ -555,7 +875,28 @@ $py$;
 
 CREATE OR REPLACE FUNCTION jev_version() RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT '0.2.0' $$;
 
-COMMENT ON FUNCTION jev(anyelement, text, float8) IS 'True when the row satisfies the natural-language condition (TypeSafe Jev). Usage: WHERE jev(tbl, ''condition'')';
+COMMENT ON FUNCTION jev(anyelement, text, float8) IS 'True when the row satisfies the natural-language condition (Jev via the provider chosen in configs/jevs.yml). Usage: WHERE jev(tbl, ''condition'')';
 COMMENT ON FUNCTION jev_prob(anyelement, text) IS 'Probability that the row satisfies the natural-language condition.';
 COMMENT ON FUNCTION jev_score(anyelement, text, text[]) IS 'Probability-weighted rating of the row along ordered levels.';
 COMMENT ON FUNCTION jev_choice(anyelement, text, text[]) IS 'Classifies the row into one of the given options.';
+
+-- ---------------------------------------------------------------- provider configuration
+-- The adapter is selected by 'jev.provider' inside configs/jevs.yml and built by JevFactory;
+-- these GUCs only feed settings to it. Define them here so fresh installs get defaults without
+-- postgresql.conf edits (ALTER EXTENSION ... UPDATE keeps any values users already set).
+DO $do$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_settings WHERE name = 'jev.config_file') THEN
+    CREATE FUNCTION public.jev_set_config_file(text) RETURNS void LANGUAGE plpython3u VOLATILE AS $py$
+import os
+p = $1 or ""
+if not p.startswith("/"):
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs", p)
+os.environ["JEV_CONFIG"] = p
+$py$;
+    COMMENT ON FUNCTION public.jev_set_config_file(text) IS
+      'Point this session at another provider config (configs/jevs.yml shape); relative paths resolve against the extension install dir.';
+    EXECUTE pg_catalog.set_config('jev.config_file', 'configs/jevs.yml', false);
+  END IF;
+END
+$do$;
